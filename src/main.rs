@@ -10,6 +10,7 @@ use reth_hl::{
     addons::{
         call_forwarder::{self, CallForwarderApiServer},
         hl_node_compliance::{self, server_restart},
+        proof_bundle::{HlProofBundleApiServer, HlProofBundleExt},
         subscribe_fixup::SubscribeFixup,
         sync_server::{HlSyncApiServer, HlSyncServer, ProviderSyncReader, set_sync_db_reader},
         tx_forwarder::{self, EthForwarderApiServer},
@@ -118,6 +119,12 @@ fn main() -> eyre::Result<()> {
                         set_sync_db_reader(Box::new(ProviderSyncReader::new(provider)));
                         ctx.modules.merge_configured(HlSyncServer.into_rpc())?;
                         info!("Sync server RPC enabled (serving blocks from database)");
+                    }
+
+                    if ext.experimental_eth_get_proof {
+                        ctx.modules.merge_configured(
+                            HlProofBundleExt::new(ctx.registry.eth_api().clone()).into_rpc(),
+                        )?;
                     }
 
                     ctx.modules.merge_configured(

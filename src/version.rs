@@ -1,6 +1,6 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::OnceLock};
 
-use reth_node_core::version::{RethCliVersionConsts, try_init_version_metadata};
+use reth_node_core::version::{RethCliVersionConsts, try_init_version_metadata, version_metadata};
 
 pub fn init_reth_hl_version() {
     let cargo_pkg_version = env!("CARGO_PKG_VERSION").to_string();
@@ -32,4 +32,12 @@ pub fn init_reth_hl_version() {
     };
 
     let _ = try_init_version_metadata(meta);
+}
+
+/// Returns a stable generator identifier for RPC provenance metadata.
+pub fn rpc_generator() -> &'static str {
+    static GENERATOR: OnceLock<String> = OnceLock::new();
+    GENERATOR
+        .get_or_init(|| format!("nanoreth/{}", version_metadata().short_version))
+        .as_str()
 }
