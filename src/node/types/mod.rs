@@ -7,7 +7,7 @@ use alloy_primitives::{Address, B256, Bytes, Log};
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable};
 use bytes::BufMut;
 use reth_ethereum_primitives::EthereumReceipt;
-use reth_primitives_traits::InMemorySize;
+use reth_primitives_traits::{InMemorySize, SignerRecoverable};
 use serde::{Deserialize, Serialize};
 
 use crate::HlBlock;
@@ -17,6 +17,7 @@ pub type ReadPrecompileCall = (Address, Vec<(ReadPrecompileInput, ReadPrecompile
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
 pub struct ReadPrecompileCalls(pub Vec<ReadPrecompileCall>);
 
+mod patch;
 pub(crate) mod reth_compat;
 
 // Re-export spot metadata functions
@@ -117,9 +118,13 @@ impl BlockAndReceipts {
         let system_txs: Vec<SystemTx> = system_tx_list
             .into_iter()
             .zip(system_receipts)
-            .map(|(tx, receipt)| SystemTx {
-                tx: reth_compat::TransactionSigned::extract_transaction(tx),
-                receipt: Some(receipt.into()),
+            .map(|(tx, receipt)| {
+                let from = tx.recover_signer().ok();
+                SystemTx {
+                    tx: reth_compat::TransactionSigned::extract_transaction(tx),
+                    receipt: Some(receipt.into()),
+                    from,
+                }
             })
             .collect();
 
@@ -225,6 +230,8 @@ enum LegacyTxType {
 pub struct SystemTx {
     pub tx: reth_compat::Transaction,
     pub receipt: Option<LegacyReceipt>,
+    #[serde(default)]
+    pub from: Option<Address>,
 }
 
 impl SystemTx {

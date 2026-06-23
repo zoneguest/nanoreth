@@ -12,10 +12,11 @@ use std::{
 };
 use tracing::info;
 
+use super::patch::recover_testnet_system_tx_sender;
 use crate::{
     HlBlock, HlBlockBody, HlHeader,
     node::{
-        primitives::TransactionSigned as TxSigned,
+        primitives::{TransactionSigned as TxSigned, transaction::address_to_s},
         spot_meta::{SpotId, erc20_contract_to_spot_token},
         types::{LegacyReceipt, ReadPrecompileCalls, SystemTx},
     },
@@ -132,6 +133,10 @@ static SPOT_EVM_MAP: LazyLock<Arc<RwLock<BTreeMap<Address, SpotId>>>> =
 // Optional database handle for persisting on-demand fetches
 static DB_HANDLE: LazyLock<Mutex<Option<Arc<DatabaseEnv>>>> = LazyLock::new(|| Mutex::new(None));
 
+// Single-flight guard: ensures only one thread fetches spot metadata from the
+// API on a cache miss, so a thundering herd of misses produces one request.
+static SPOT_FETCH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 /// Set the database handle for persisting spot metadata
 pub fn set_spot_metadata_db(db: Arc<DatabaseEnv>) {
     *DB_HANDLE.lock().unwrap() = Some(db);
@@ -175,14 +180,29 @@ fn persist_spot_metadata_to_db(metadata: &BTreeMap<Address, SpotId>) {
     }
 }
 
-fn system_tx_to_reth_transaction(transaction: &SystemTx, chain_id: u64) -> TxSigned {
+fn system_tx_to_reth_transaction(
+    transaction: &SystemTx,
+    chain_id: u64,
+    block_number: u64,
+) -> TxSigned {
     let Transaction::Legacy(tx) = &transaction.tx else {
         panic!("Unexpected transaction type");
     };
     let TxKind::Call(to) = tx.to else {
         panic!("Unexpected contract creation");
     };
-    let s = if tx.input.is_empty() {
+    // System txs arrive unsigned; nanoreth fabricates the signature below, encoding `msg.sender`
+    // into `s` (via `address_to_s`) so `s_to_address(s)` recovers the holder and nonces validate.
+    let s = if let Some(sender) = transaction.from {
+        // Prefer the authoritative upstream `from`.
+        address_to_s(sender)
+    } else if let Some(sender) =
+        recover_testnet_system_tx_sender(chain_id, block_number, to, transaction.receipt.as_ref())
+    {
+        // Fall back to `super::patch` testnet log recovery.
+        address_to_s(sender)
+    } else if tx.input.is_empty() {
+        // Native HYPE transfer: sender is the HYPE system address (0x2222…2222), encoded `s == 1`.
         U256::from(0x1)
     } else {
         loop {
@@ -190,7 +210,17 @@ fn system_tx_to_reth_transaction(transaction: &SystemTx, chain_id: u64) -> TxSig
                 break spot.to_s();
             }
 
-            // Cache miss - fetch from API, update cache, and persist to database
+            // Cache miss - single-flight the API fetch so concurrent misses don't
+            // each hit the API. Only the thread holding SPOT_FETCH_LOCK fetches;
+            // the rest block here and re-check the cache once it's released.
+            let _fetch_guard = SPOT_FETCH_LOCK.lock().unwrap();
+
+            // Double-checked: another thread may have populated the cache while we
+            // waited for the fetch lock.
+            if SPOT_EVM_MAP.read().unwrap().contains_key(&to) {
+                continue;
+            }
+
             info!("Contract not found: {to:?} from spot mapping, fetching from API...");
             let metadata = erc20_contract_to_spot_token(chain_id).unwrap();
             *SPOT_EVM_MAP.write().unwrap() = metadata.clone();
@@ -214,7 +244,10 @@ impl SealedBlock {
         system_txs.retain(|tx| tx.receipt.is_some());
 
         let mut merged_txs = vec![];
-        merged_txs.extend(system_txs.iter().map(|tx| system_tx_to_reth_transaction(tx, chain_id)));
+        let block_number = self.header.header.number;
+        merged_txs.extend(
+            system_txs.iter().map(|tx| system_tx_to_reth_transaction(tx, chain_id, block_number)),
+        );
         merged_txs.extend(self.body.transactions.iter().map(|tx| tx.to_reth_transaction()));
 
         let mut merged_receipts = vec![];
@@ -241,5 +274,150 @@ impl SealedBlock {
             ),
             body: block_body,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chainspec::TESTNET_CHAIN_ID;
+    use alloy_consensus::{Transaction as _, TxType};
+    use alloy_primitives::{Log, LogData, address, b256};
+    use reth_ethereum_primitives::EthereumReceipt;
+    use reth_primitives_traits::SignerRecoverable;
+
+    // The single token targeted by the testnet sender-recovery patch.
+    const TOKEN: Address = address!("2b3370ee501b4a559b57d449569354196457d8ab");
+    const FROM_BLOCK: u64 = 55231857;
+    const HOLDER_A: Address = address!("f9b10ef826e9aa275f1813034e3bd9b80224e535");
+    const HOLDER_B: Address = address!("0b80659a4076e9e93c7dbe0f10675a16a3e5c206");
+
+    fn transfer_log(from: Address, to: Address) -> Log {
+        Log {
+            address: TOKEN,
+            data: LogData::new_unchecked(
+                vec![
+                    b256!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"),
+                    from.into_word(),
+                    to.into_word(),
+                ],
+                U256::from(1_000u64).to_be_bytes::<32>().to_vec().into(),
+            ),
+        }
+    }
+
+    fn system_tx(from: Address, to: Address, nonce: u64) -> SystemTx {
+        let receipt: LegacyReceipt = EthereumReceipt {
+            tx_type: TxType::Legacy,
+            success: true,
+            cumulative_gas_used: 0,
+            logs: vec![transfer_log(from, to)],
+        }
+        .into();
+        SystemTx {
+            tx: Transaction::Legacy(TxLegacy {
+                chain_id: Some(TESTNET_CHAIN_ID),
+                nonce,
+                gas_price: 0,
+                gas_limit: 200_000,
+                to: TxKind::Call(to),
+                value: U256::ZERO,
+                // transfer(address,uint256) selector; input non-empty
+                input: Bytes::from_static(&[0xa9, 0x05, 0x9c, 0xbb]),
+            }),
+            receipt: Some(receipt),
+            // `from` path set explicitly per-test.
+            from: None,
+        }
+    }
+
+    #[test]
+    fn testnet_conversion_recovers_real_holder() {
+        // Full path: testnet system_tx -> synthetic signature -> recover_signer == real sender.
+        // Both interleaved holders recover independently (the synthetic collision is gone).
+        let tx = system_tx(HOLDER_B, TOKEN, 1);
+        let signed = system_tx_to_reth_transaction(&tx, TESTNET_CHAIN_ID, FROM_BLOCK);
+        assert_eq!(signed.gas_price(), Some(0)); // recognised as a system tx
+        assert_eq!(signed.recover_signer().unwrap(), HOLDER_B);
+
+        let tx2 = system_tx(HOLDER_A, TOKEN, 0);
+        let signed2 = system_tx_to_reth_transaction(&tx2, TESTNET_CHAIN_ID, FROM_BLOCK);
+        assert_eq!(signed2.recover_signer().unwrap(), HOLDER_A);
+    }
+
+    #[test]
+    fn from_field_takes_precedence_over_log() {
+        // On disagreement, upstream `from` wins over the `Transfer` log.
+        let mut tx = system_tx(HOLDER_A, TOKEN, 3);
+        tx.from = Some(HOLDER_B);
+        let signed = system_tx_to_reth_transaction(&tx, TESTNET_CHAIN_ID, FROM_BLOCK);
+        assert_eq!(signed.recover_signer().unwrap(), HOLDER_B);
+    }
+
+    #[test]
+    fn from_db_round_trip_preserves_real_holder() {
+        // A `from`-bearing system tx past the log-recovery window survives the sync round trip
+        // (to_reth_block -> from_db -> to_reth_block) recovering the real holder, not a collision.
+        let mut tx = system_tx(HOLDER_A, TOKEN, 1);
+        tx.from = Some(HOLDER_B);
+        assert_eq!(round_trip_signer(tx), HOLDER_B);
+    }
+
+    #[test]
+    fn from_db_round_trip_preserves_hype_sender() {
+        // A native HYPE transfer (empty input, sender = HYPE system address -> `s == 1`) recovers
+        // to 0x2222…2222 and re-encodes back to `s == 1` across the round trip - no drift.
+        let receipt: LegacyReceipt = EthereumReceipt {
+            tx_type: TxType::Legacy,
+            success: true,
+            cumulative_gas_used: 0,
+            logs: vec![],
+        }
+        .into();
+        let tx = SystemTx {
+            tx: Transaction::Legacy(TxLegacy {
+                chain_id: Some(TESTNET_CHAIN_ID),
+                nonce: 0,
+                gas_price: 0,
+                gas_limit: 200_000,
+                to: TxKind::Call(TOKEN),
+                value: U256::ZERO,
+                input: Bytes::new(),
+            }),
+            receipt: Some(receipt),
+            from: None,
+        };
+        assert_eq!(round_trip_signer(tx), address!("2222222222222222222222222222222222222222"));
+    }
+
+    #[test]
+    fn degenerate_from_one_is_escaped_and_round_trips() {
+        // `from == 0x00..01` would collide with the `s == 1` sentinel; the escape lifts it above
+        // the address space so it recovers to 0x00..01 (not the 0x2222 sentinel) and round-trips.
+        let one = address!("0000000000000000000000000000000000000001");
+        let mut tx = system_tx(HOLDER_A, TOKEN, 1);
+        tx.from = Some(one);
+        let signed = system_tx_to_reth_transaction(&tx, TESTNET_CHAIN_ID, FROM_BLOCK);
+        assert_eq!(signed.recover_signer().unwrap(), one);
+        assert_eq!(round_trip_signer(tx), one);
+    }
+
+    /// Full sync round trip (to_reth_block -> from_db -> to_reth_block); returns the re-served
+    /// system tx's recovered signer, which must equal the original's.
+    fn round_trip_signer(tx: SystemTx) -> Address {
+        let sealed = SealedBlock {
+            header: SealedHeader {
+                hash: Default::default(),
+                header: Header { number: 56_000_000, ..Default::default() },
+            },
+            body: BlockBody { transactions: vec![], ommers: vec![], withdrawals: None },
+        };
+        let receipts = vec![tx.receipt.clone().unwrap().into()];
+        let block =
+            sealed.to_reth_block(Default::default(), None, vec![tx], vec![], TESTNET_CHAIN_ID);
+        let restored = crate::node::types::BlockAndReceipts::from_db(block, receipts);
+        assert_eq!(restored.system_txs.len(), 1);
+        let reserved = restored.to_reth_block(TESTNET_CHAIN_ID);
+        reserved.body.inner.transactions[0].recover_signer().unwrap()
     }
 }
