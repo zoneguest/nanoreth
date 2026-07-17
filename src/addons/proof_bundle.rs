@@ -68,6 +68,17 @@ pub struct HlProofBundleProvenance {
 /// A Hyper-specific proof endpoint that exposes explicit provenance metadata.
 ///
 /// Method name: `hl_getProofBundle`
+///
+/// Scope and trust model (HyperEVM headers carry `stateRoot = 0`):
+/// - `proofRoot` identifies the serving node's synthetic keccak-MPT root
+///   (`rootType = "synthetic_mpt_v1"`). Clients can validate the enclosed EIP-1186 proof
+///   against it, but cannot authenticate it against the HL header or hl-node.
+/// - Non-pending requests resolve to a canonical block hash before proof generation, so
+///   `block` and `accountProof` are hash-pinned to the same historical state.
+/// - `pending` is passed through to `eth_getProof` unchanged. Its returned block metadata is
+///   resolved independently and may not describe the exact pending state used for the proof.
+/// - Nanoreth does not guarantee trie state for deep-historical blocks, so this endpoint
+///   shares the `--experimental-eth-get-proof` gate with `eth_getProof`.
 #[rpc(server, namespace = "hl")]
 #[async_trait]
 pub trait HlProofBundleApi {
@@ -108,24 +119,25 @@ where
         trace!(target: "rpc::hl", ?address, ?keys, ?requested_block, "Serving hl_getProofBundle");
 
         let provider = self.eth_api.provider();
-        let proof_block = if requested_block.is_pending() {
-            // Preserve eth_getProof pending-state semantics instead of collapsing to a canonical hash.
-            requested_block
-        } else {
+        let (proof_block, block_hash) = if requested_block.is_pending() {
+            // Preserve eth_getProof pending-state handling. Metadata is resolved separately,
+            // so do not treat `block` as an atomic snapshot of the pending proof state.
             let block_hash = provider
                 .block_hash_for_id(requested_block)
                 .map_err(|err| internal_rpc_err(format!("Failed to resolve block hash: {err}")))?
                 .ok_or_else(|| EthApiError::HeaderNotFound(requested_block))?;
-            // Resolve canonical tags like `latest` once, then pin all subsequent reads to that block.
-            BlockId::Hash(block_hash.into())
+            (requested_block, block_hash)
+        } else {
+            // Resolve tags such as `latest` once, then use the hash for every later read.
+            let block_hash = provider
+                .block_hash_for_id(requested_block)
+                .map_err(|err| internal_rpc_err(format!("Failed to resolve block hash: {err}")))?
+                .ok_or_else(|| EthApiError::HeaderNotFound(requested_block))?;
+            (BlockId::Hash(block_hash.into()), block_hash)
         };
         let block_number = provider
             .block_number_for_id(proof_block)
             .map_err(|err| internal_rpc_err(format!("Failed to resolve block number: {err}")))?
-            .ok_or_else(|| EthApiError::HeaderNotFound(proof_block))?;
-        let block_hash = provider
-            .block_hash_for_id(proof_block)
-            .map_err(|err| internal_rpc_err(format!("Failed to resolve block hash: {err}")))?
             .ok_or_else(|| EthApiError::HeaderNotFound(proof_block))?;
 
         let proof = EthState::get_proof(&self.eth_api, address, keys, Some(proof_block))?.await?;
@@ -236,6 +248,30 @@ mod tests {
             err.message(),
             "eth_getProof returned an empty accountProof for address 0x0000000000000000000000000000000000000011 at block 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
+    }
+
+    #[test]
+    fn exclusion_proof_for_absent_account_still_yields_proof_root() {
+        // EIP-1186 exclusion proof: the account does not exist, but eth_getProof
+        // still returns a non-empty `account_proof` (the branch proving the key is
+        // absent) with zeroed balance/nonce and the canonical empty code/storage
+        // hashes. This is the shape a ZK zero-balance proof depends on, so it must
+        // derive a valid `proofRoot` rather than tripping the empty-proof guard
+        // above. The distinction is: empty proof vec -> error; non-empty exclusion
+        // branch for a zero account -> ok.
+        let root_node = Bytes::from_static(&[0xf8, 0x51, 0x80, 0x80]);
+        let proof = EIP1186AccountProofResponse {
+            address: address!("0x0000000000000000000000000000000000000011"),
+            balance: U256::ZERO,
+            nonce: 0,
+            code_hash: keccak256(b""),       // empty code: keccak256("")
+            storage_hash: keccak256([0x80]), // empty storage trie: keccak256(rlp(""))
+            account_proof: vec![root_node.clone()],
+            storage_proof: vec![],
+        };
+
+        let root = proof_root_from_account_proof(&proof, B256::ZERO).unwrap();
+        assert_eq!(root, keccak256(root_node));
     }
 
     #[tokio::test]
