@@ -1,7 +1,7 @@
 use crate::HlBlock;
 use crate::addons::inclusion_proof::{HlInclusionProof, ordered_trie_inclusion_proof};
 use crate::node::rpc::{HlEthApi, HlRpcNodeCore};
-use alloy_consensus::{Header, transaction::TxHashRef};
+use alloy_consensus::{Header, TxReceipt, transaction::TxHashRef};
 use alloy_eips::{BlockId, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes, keccak256};
 use alloy_rpc_types_eth::EIP1186AccountProofResponse;
@@ -10,10 +10,13 @@ use jsonrpsee::proc_macros::rpc;
 use jsonrpsee_core::{RpcResult, async_trait};
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth::rpc::result::internal_rpc_err;
+use reth_ethereum_primitives::Receipt;
 use reth_rpc_convert::RpcConvert;
 use reth_rpc_eth_api::{FromEvmError, RpcNodeCore, helpers::EthState};
 use reth_rpc_eth_types::EthApiError;
-use reth_storage_api::{BlockIdReader, BlockNumReader, BlockReader, HeaderProvider, ProviderHeader};
+use reth_storage_api::{
+    BlockIdReader, BlockNumReader, BlockReader, HeaderProvider, ProviderHeader, ReceiptProvider,
+};
 use serde::Serialize;
 use tracing::trace;
 
@@ -50,32 +53,57 @@ fn storage_root_from_proof(proof: &EIP1186AccountProofResponse) -> Option<B256> 
     (!proof.storage_proof.is_empty()).then_some(proof.storage_hash)
 }
 
-/// Build a transaction inclusion proof against a block's `transactionsRoot`.
+/// Build transaction and receipt inclusion proofs for `target_hash` in a block.
 ///
-/// The root-defining set is the block body **excluding system transactions**, in body order
-/// (matching `HlBlockBody::calculate_tx_root`), so `target_hash` is located within that filtered
-/// list and each tx is encoded with `encode_2718`. The recomputed root is checked against
-/// `expected_root` (the header value) so a wrong item set/order surfaces as an error, never a bad
-/// proof.
-fn tx_inclusion_proof(
+/// Both root-defining sets are reconstructed exactly as the block was built
+/// (`src/node/evm/config.rs`): transactions exclude system txs (`!is_system_transaction()`);
+/// receipts keep only `cumulative_gas_used() != 0` (which drops the zero-gas system-tx receipts —
+/// verified against live data). Those two filters select the same positions in order, so the tx's
+/// index doubles as the receipt index — asserted via a length check. Each recomputed root is
+/// checked against the header before returning, so a wrong set/order/encoding errors out rather
+/// than yielding a bad proof.
+fn tx_and_receipt_proofs(
     block: &HlBlock,
+    receipts: &[Receipt],
     target_hash: B256,
-    expected_root: B256,
-) -> RpcResult<HlInclusionProof> {
+    tx_root: B256,
+    receipts_root: B256,
+) -> RpcResult<(HlInclusionProof, HlInclusionProof)> {
     let non_system: Vec<_> =
         block.body.inner.transactions.iter().filter(|t| !t.is_system_transaction()).collect();
     let target = non_system.iter().position(|t| *t.tx_hash() == target_hash).ok_or_else(|| {
         internal_rpc_err(format!("transaction {target_hash} not found among non-system txs"))
     })?;
-    let items: Vec<Vec<u8>> = non_system.iter().map(|t| t.encoded_2718()).collect();
-    let (proof, root) = ordered_trie_inclusion_proof(&items, target)
+
+    let tx_items: Vec<Vec<u8>> = non_system.iter().map(|t| t.encoded_2718()).collect();
+    let (tx_proof, tx_computed) = ordered_trie_inclusion_proof(&tx_items, target)
         .ok_or_else(|| internal_rpc_err("failed to build transaction inclusion proof"))?;
-    if root != expected_root {
+    if tx_computed != tx_root {
         return Err(internal_rpc_err(format!(
-            "recomputed transactionsRoot {root} does not match header {expected_root}"
+            "recomputed transactionsRoot {tx_computed} does not match header {tx_root}"
         )));
     }
-    Ok(proof)
+
+    // receipts_for_root: `cumulative_gas_used != 0`, aligned 1:1 (and in order) with non-system txs.
+    let rc_for_root: Vec<_> = receipts.iter().filter(|r| r.cumulative_gas_used() != 0).collect();
+    if rc_for_root.len() != non_system.len() {
+        return Err(internal_rpc_err(format!(
+            "non-system tx count ({}) != root-defining receipt count ({}); cannot align receipt proof",
+            non_system.len(),
+            rc_for_root.len()
+        )));
+    }
+    let rc_items: Vec<Vec<u8>> =
+        rc_for_root.iter().map(|r| r.with_bloom_ref().encoded_2718()).collect();
+    let (receipt_proof, rc_computed) = ordered_trie_inclusion_proof(&rc_items, target)
+        .ok_or_else(|| internal_rpc_err("failed to build receipt inclusion proof"))?;
+    if rc_computed != receipts_root {
+        return Err(internal_rpc_err(format!(
+            "recomputed receiptsRoot {rc_computed} does not match header {receipts_root}"
+        )));
+    }
+
+    Ok((tx_proof, receipt_proof))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -104,6 +132,12 @@ pub struct HlProofBundleResponse {
     /// `alloy_trie::proof::verify_proof(header.transactionsRoot, key, Some(value), proof)`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_proof: Option<HlInclusionProof>,
+    /// (B1) Receipt inclusion proof against `header.receiptsRoot`, present only when a `tx` selector
+    /// was supplied. Same canonical anchor as `txProof`; the receipt sits at the same index as the
+    /// transaction. Verify with
+    /// `alloy_trie::proof::verify_proof(header.receiptsRoot, key, Some(value), proof)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_proof: Option<HlInclusionProof>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -198,10 +232,10 @@ pub struct HlProofBundleProvenance {
 ///   account proof in turn authenticates against `proofRoot` — so contract-state proofs share the
 ///   account proof's trust anchor. `storageRoot` is surfaced in `provenance` only when keys are
 ///   requested.
-/// - Passing a `tx` hash adds `txProof`: an inclusion proof of that transaction against
-///   `header.transactionsRoot`. Unlike `proofRoot`, that root is canonical (committed via the block
-///   hash into the HyperCore app hash), so the proof is trustless. The `tx` must be a non-system
-///   transaction of the resolved block.
+/// - Passing a `tx` hash adds `txProof` and `receiptProof`: inclusion proofs of that transaction
+///   and its receipt against `header.transactionsRoot` / `header.receiptsRoot`. Unlike `proofRoot`,
+///   those roots are canonical (committed via the block hash into the HyperCore app hash), so the
+///   proofs are trustless. The `tx` must be a non-system transaction of the resolved block.
 /// - Nanoreth does not guarantee trie state for deep-historical blocks, so this endpoint
 ///   shares the `--experimental-eth-get-proof` gate with `eth_getProof`.
 #[rpc(server, namespace = "hl")]
@@ -232,7 +266,11 @@ impl<N, Rpc> HlProofBundleApiServer for HlProofBundleExt<N, Rpc>
 where
     N: HlRpcNodeCore,
     EthApiError: FromEvmError<N::Evm>,
-    N::Provider: BlockIdReader + ChainSpecProvider + HeaderProvider + BlockReader<Block = HlBlock>,
+    N::Provider: BlockIdReader
+        + ChainSpecProvider
+        + HeaderProvider
+        + BlockReader<Block = HlBlock>
+        + ReceiptProvider<Receipt = Receipt>,
     ProviderHeader<N::Provider>: Into<Header>,
     Rpc: RpcConvert<Primitives = N::Primitives, Error = EthApiError>,
 {
@@ -305,19 +343,31 @@ where
             None => None,
         };
 
-        // (B1) Optional transaction inclusion proof against the canonical `transactionsRoot`.
-        let tx_proof = match tx {
+        // (B1) Optional transaction + receipt inclusion proofs against the canonical
+        // `transactionsRoot` / `receiptsRoot`.
+        let (tx_proof, receipt_proof) = match tx {
             Some(target_hash) => {
-                let expected_root = header.as_ref().map(|h| h.transactions_root).ok_or_else(|| {
-                    internal_rpc_err("header unavailable for block; cannot build transaction proof")
+                let hdr = header.as_ref().ok_or_else(|| {
+                    internal_rpc_err("header unavailable for block; cannot build tx/receipt proofs")
                 })?;
                 let full_block = provider
                     .block_by_hash(block_hash)
                     .map_err(|err| internal_rpc_err(format!("Failed to load block: {err}")))?
                     .ok_or_else(|| EthApiError::HeaderNotFound(BlockId::Hash(block_hash.into())))?;
-                Some(tx_inclusion_proof(&full_block, target_hash, expected_root)?)
+                let receipts = provider
+                    .receipts_by_block(block_hash.into())
+                    .map_err(|err| internal_rpc_err(format!("Failed to load receipts: {err}")))?
+                    .ok_or_else(|| EthApiError::HeaderNotFound(BlockId::Hash(block_hash.into())))?;
+                let (tx_p, receipt_p) = tx_and_receipt_proofs(
+                    &full_block,
+                    &receipts,
+                    target_hash,
+                    hdr.transactions_root,
+                    hdr.receipts_root,
+                )?;
+                (Some(tx_p), Some(receipt_p))
             }
-            None => None,
+            None => (None, None),
         };
 
         Ok(HlProofBundleResponse {
@@ -338,6 +388,7 @@ where
             },
             account_proof: proof,
             tx_proof,
+            receipt_proof,
         })
     }
 }
@@ -420,6 +471,12 @@ mod tests {
                     key: Bytes::from_static(&[0x01]),
                     value: Bytes::from_static(&[0xaa, 0xbb]),
                     proof: vec![Bytes::from_static(&[0xc0]), Bytes::from_static(&[0xc1])],
+                }),
+                receipt_proof: Some(HlInclusionProof {
+                    index: 1,
+                    key: Bytes::from_static(&[0x01]),
+                    value: Bytes::from_static(&[0xcc, 0xdd]),
+                    proof: vec![Bytes::from_static(&[0xd0])],
                 }),
             })
         }
@@ -541,12 +598,15 @@ mod tests {
         );
         assert_eq!(result["accountProof"]["storageProof"][0]["value"], "0x7b");
         assert_eq!(result["accountProof"]["storageProof"][0]["proof"][0], "0x1122");
-        // B1: transaction inclusion proof surfaced in the envelope.
+        // B1: transaction + receipt inclusion proofs surfaced in the envelope.
         assert_eq!(result["txProof"]["index"], "0x1");
         assert_eq!(result["txProof"]["key"], "0x01");
         assert_eq!(result["txProof"]["value"], "0xaabb");
         assert_eq!(result["txProof"]["proof"][0], "0xc0");
         assert_eq!(result["txProof"]["proof"][1], "0xc1");
+        assert_eq!(result["receiptProof"]["index"], "0x1");
+        assert_eq!(result["receiptProof"]["value"], "0xccdd");
+        assert_eq!(result["receiptProof"]["proof"][0], "0xd0");
     }
 
     #[test]
