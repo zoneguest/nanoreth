@@ -1,6 +1,8 @@
+use crate::HlBlock;
+use crate::addons::inclusion_proof::{HlInclusionProof, ordered_trie_inclusion_proof};
 use crate::node::rpc::{HlEthApi, HlRpcNodeCore};
-use alloy_consensus::Header;
-use alloy_eips::BlockId;
+use alloy_consensus::{Header, transaction::TxHashRef};
+use alloy_eips::{BlockId, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes, keccak256};
 use alloy_rpc_types_eth::EIP1186AccountProofResponse;
 use alloy_serde::JsonStorageKey;
@@ -11,7 +13,7 @@ use reth::rpc::result::internal_rpc_err;
 use reth_rpc_convert::RpcConvert;
 use reth_rpc_eth_api::{FromEvmError, RpcNodeCore, helpers::EthState};
 use reth_rpc_eth_types::EthApiError;
-use reth_storage_api::{BlockIdReader, BlockNumReader, HeaderProvider, ProviderHeader};
+use reth_storage_api::{BlockIdReader, BlockNumReader, BlockReader, HeaderProvider, ProviderHeader};
 use serde::Serialize;
 use tracing::trace;
 
@@ -48,6 +50,34 @@ fn storage_root_from_proof(proof: &EIP1186AccountProofResponse) -> Option<B256> 
     (!proof.storage_proof.is_empty()).then_some(proof.storage_hash)
 }
 
+/// Build a transaction inclusion proof against a block's `transactionsRoot`.
+///
+/// The root-defining set is the block body **excluding system transactions**, in body order
+/// (matching `HlBlockBody::calculate_tx_root`), so `target_hash` is located within that filtered
+/// list and each tx is encoded with `encode_2718`. The recomputed root is checked against
+/// `expected_root` (the header value) so a wrong item set/order surfaces as an error, never a bad
+/// proof.
+fn tx_inclusion_proof(
+    block: &HlBlock,
+    target_hash: B256,
+    expected_root: B256,
+) -> RpcResult<HlInclusionProof> {
+    let non_system: Vec<_> =
+        block.body.inner.transactions.iter().filter(|t| !t.is_system_transaction()).collect();
+    let target = non_system.iter().position(|t| *t.tx_hash() == target_hash).ok_or_else(|| {
+        internal_rpc_err(format!("transaction {target_hash} not found among non-system txs"))
+    })?;
+    let items: Vec<Vec<u8>> = non_system.iter().map(|t| t.encoded_2718()).collect();
+    let (proof, root) = ordered_trie_inclusion_proof(&items, target)
+        .ok_or_else(|| internal_rpc_err("failed to build transaction inclusion proof"))?;
+    if root != expected_root {
+        return Err(internal_rpc_err(format!(
+            "recomputed transactionsRoot {root} does not match header {expected_root}"
+        )));
+    }
+    Ok(proof)
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HlProofBundleResponse {
@@ -67,6 +97,13 @@ pub struct HlProofBundleResponse {
     pub header: Option<HlProofBundleHeader>,
     pub provenance: HlProofBundleProvenance,
     pub account_proof: EIP1186AccountProofResponse,
+    /// (B1) Transaction inclusion proof against `header.transactionsRoot`, present only when a tx
+    /// selector (`tx` hash) was supplied. That root is canonical — committed via the block hash →
+    /// `evm_db.block_hashes` → `app_hash` → ed25519 quorum — so this is a trustless cross-chain
+    /// claim, unlike the account `proofRoot`. Verify with
+    /// `alloy_trie::proof::verify_proof(header.transactionsRoot, key, Some(value), proof)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_proof: Option<HlInclusionProof>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -161,6 +198,10 @@ pub struct HlProofBundleProvenance {
 ///   account proof in turn authenticates against `proofRoot` — so contract-state proofs share the
 ///   account proof's trust anchor. `storageRoot` is surfaced in `provenance` only when keys are
 ///   requested.
+/// - Passing a `tx` hash adds `txProof`: an inclusion proof of that transaction against
+///   `header.transactionsRoot`. Unlike `proofRoot`, that root is canonical (committed via the block
+///   hash into the HyperCore app hash), so the proof is trustless. The `tx` must be a non-system
+///   transaction of the resolved block.
 /// - Nanoreth does not guarantee trie state for deep-historical blocks, so this endpoint
 ///   shares the `--experimental-eth-get-proof` gate with `eth_getProof`.
 #[rpc(server, namespace = "hl")]
@@ -172,6 +213,7 @@ pub trait HlProofBundleApi {
         address: Address,
         keys: Vec<JsonStorageKey>,
         block: Option<BlockId>,
+        tx: Option<B256>,
     ) -> RpcResult<HlProofBundleResponse>;
 }
 
@@ -190,7 +232,7 @@ impl<N, Rpc> HlProofBundleApiServer for HlProofBundleExt<N, Rpc>
 where
     N: HlRpcNodeCore,
     EthApiError: FromEvmError<N::Evm>,
-    N::Provider: BlockIdReader + ChainSpecProvider + HeaderProvider,
+    N::Provider: BlockIdReader + ChainSpecProvider + HeaderProvider + BlockReader<Block = HlBlock>,
     ProviderHeader<N::Provider>: Into<Header>,
     Rpc: RpcConvert<Primitives = N::Primitives, Error = EthApiError>,
 {
@@ -199,6 +241,7 @@ where
         address: Address,
         keys: Vec<JsonStorageKey>,
         block: Option<BlockId>,
+        tx: Option<B256>,
     ) -> RpcResult<HlProofBundleResponse> {
         let requested_block = block.unwrap_or_default();
         trace!(target: "rpc::hl", ?address, ?keys, ?requested_block, "Serving hl_getProofBundle");
@@ -262,6 +305,21 @@ where
             None => None,
         };
 
+        // (B1) Optional transaction inclusion proof against the canonical `transactionsRoot`.
+        let tx_proof = match tx {
+            Some(target_hash) => {
+                let expected_root = header.as_ref().map(|h| h.transactions_root).ok_or_else(|| {
+                    internal_rpc_err("header unavailable for block; cannot build transaction proof")
+                })?;
+                let full_block = provider
+                    .block_by_hash(block_hash)
+                    .map_err(|err| internal_rpc_err(format!("Failed to load block: {err}")))?
+                    .ok_or_else(|| EthApiError::HeaderNotFound(BlockId::Hash(block_hash.into())))?;
+                Some(tx_inclusion_proof(&full_block, target_hash, expected_root)?)
+            }
+            None => None,
+        };
+
         Ok(HlProofBundleResponse {
             version: PROOF_BUNDLE_VERSION,
             chain_id,
@@ -279,6 +337,7 @@ where
                 concise_lt_hashes: None,
             },
             account_proof: proof,
+            tx_proof,
         })
     }
 }
@@ -302,6 +361,7 @@ mod tests {
             _address: Address,
             _keys: Vec<JsonStorageKey>,
             _block: Option<BlockId>,
+            _tx: Option<B256>,
         ) -> RpcResult<HlProofBundleResponse> {
             Ok(HlProofBundleResponse {
                 version: PROOF_BUNDLE_VERSION,
@@ -355,6 +415,12 @@ mod tests {
                         ..Default::default()
                     }],
                 },
+                tx_proof: Some(HlInclusionProof {
+                    index: 1,
+                    key: Bytes::from_static(&[0x01]),
+                    value: Bytes::from_static(&[0xaa, 0xbb]),
+                    proof: vec![Bytes::from_static(&[0xc0]), Bytes::from_static(&[0xc1])],
+                }),
             })
         }
     }
@@ -475,6 +541,12 @@ mod tests {
         );
         assert_eq!(result["accountProof"]["storageProof"][0]["value"], "0x7b");
         assert_eq!(result["accountProof"]["storageProof"][0]["proof"][0], "0x1122");
+        // B1: transaction inclusion proof surfaced in the envelope.
+        assert_eq!(result["txProof"]["index"], "0x1");
+        assert_eq!(result["txProof"]["key"], "0x01");
+        assert_eq!(result["txProof"]["value"], "0xaabb");
+        assert_eq!(result["txProof"]["proof"][0], "0xc0");
+        assert_eq!(result["txProof"]["proof"][1], "0xc1");
     }
 
     #[test]

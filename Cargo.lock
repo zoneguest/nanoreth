@@ -9351,6 +9351,7 @@ dependencies = [
  "alloy-signer",
  "alloy-sol-macro",
  "alloy-sol-types",
+ "alloy-trie",
  "async-trait",
  "auto_impl",
  "aws-config",
