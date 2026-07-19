@@ -1,6 +1,7 @@
 use crate::node::rpc::{HlEthApi, HlRpcNodeCore};
+use alloy_consensus::Header;
 use alloy_eips::BlockId;
-use alloy_primitives::{Address, B256, keccak256};
+use alloy_primitives::{Address, B256, Bytes, keccak256};
 use alloy_rpc_types_eth::EIP1186AccountProofResponse;
 use alloy_serde::JsonStorageKey;
 use jsonrpsee::proc_macros::rpc;
@@ -10,7 +11,7 @@ use reth::rpc::result::internal_rpc_err;
 use reth_rpc_convert::RpcConvert;
 use reth_rpc_eth_api::{FromEvmError, RpcNodeCore, helpers::EthState};
 use reth_rpc_eth_types::EthApiError;
-use reth_storage_api::BlockIdReader;
+use reth_storage_api::{BlockIdReader, BlockNumReader, HeaderProvider, ProviderHeader};
 use serde::Serialize;
 use tracing::trace;
 
@@ -44,6 +45,16 @@ pub struct HlProofBundleResponse {
     #[serde(with = "alloy_serde::quantity")]
     pub chain_id: u64,
     pub block: HlProofBundleBlock,
+    /// Canonical EVM header for `block`, RLP-encoded, with its committed sub-roots surfaced.
+    ///
+    /// `rlp` is the RLP of the *inner* `alloy_consensus::Header` — `HlHeader.extras` are not part
+    /// of the block hash — so `keccak256(rlp) == block.hash`. `stateRoot` is expected to be zero on
+    /// HyperEVM; `transactionsRoot`/`receiptsRoot` are the canonical roots committed via the block
+    /// hash (and therefore, transitively, via `evm_db.block_hashes` in the HyperCore app hash),
+    /// which is the anchor for future tx/receipt/log inclusion proofs. `None` only when the header
+    /// could not be loaded (e.g. a pending block).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header: Option<HlProofBundleHeader>,
     pub provenance: HlProofBundleProvenance,
     pub account_proof: EIP1186AccountProofResponse,
 }
@@ -58,11 +69,61 @@ pub struct HlProofBundleBlock {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HlProofBundleHeader {
+    /// RLP of the canonical `alloy_consensus::Header`; `keccak256(rlp) == block.hash`.
+    pub rlp: Bytes,
+    /// Expected to be zero on HyperEVM (headers carry `stateRoot = 0`).
+    pub state_root: B256,
+    pub transactions_root: B256,
+    pub receipts_root: B256,
+}
+
+/// How strongly this bundle is anchored to HyperCore consensus.
+///
+/// Computed per response from the anchoring data actually present — never a hardcoded constant.
+/// Today the endpoint carries no HyperCore anchor, so it resolves to [`AnchorType::SingleNode`];
+/// once the co-located hl-node app hash + quorum certificate are wired in (Tier A2), a recent
+/// finalized block resolves to [`AnchorType::ConsensusQuorum`], while unfinalized or
+/// beyond-retention blocks continue to resolve to [`AnchorType::SingleNode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorType {
+    /// No HyperCore anchor present; only the serving node vouches for `proofRoot`.
+    SingleNode,
+    /// Signed by an external attestor committee (Path D). Reserved; not yet produced.
+    AttestorQuorum,
+    /// Backed by the hl-node quorum-signed app hash for this block.
+    ConsensusQuorum,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HlProofBundleProvenance {
     pub proof_root: B256,
     pub root_type: &'static str,
     pub generator: &'static str,
     pub proof_format: &'static str,
+    /// Per-response trust discriminant (see [`AnchorType`]).
+    pub anchor_type: AnchorType,
+    /// EVM blocks elapsed since `block.number` (`best_block_number - block.number`).
+    ///
+    /// HyperCore commits EVM block hashes in `evm_db.block_hashes` with a 256-block window, so a
+    /// consumer uses this to tell whether the `H_evm ∈ block_hashes` link is still provable.
+    #[serde(with = "alloy_serde::quantity")]
+    pub core_commitment_depth: u64,
+    /// `BLAKE3(ConciseLtHashes)` — HyperCore's canonical EVM state commitment for this block.
+    ///
+    /// Sourced from the co-located hl-node ABCI state (Tier A2); `None` until that reader lands.
+    /// Deliberately not recomputed locally: a byte-exact value requires hl-node's canonical entry
+    /// serialization, which is not yet reproduced, and a mismatching value would be worse than
+    /// absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evm_state_commitment: Option<B256>,
+    /// The three HyperCore LtHash accumulator digests `{accounts, contracts, storage}`.
+    ///
+    /// Same source and caveat as [`Self::evm_state_commitment`]; `None` until Tier A2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concise_lt_hashes: Option<[B256; 3]>,
 }
 
 /// A Hyper-specific proof endpoint that exposes explicit provenance metadata.
@@ -106,7 +167,8 @@ impl<N, Rpc> HlProofBundleApiServer for HlProofBundleExt<N, Rpc>
 where
     N: HlRpcNodeCore,
     EthApiError: FromEvmError<N::Evm>,
-    N::Provider: BlockIdReader + ChainSpecProvider,
+    N::Provider: BlockIdReader + ChainSpecProvider + HeaderProvider,
+    ProviderHeader<N::Provider>: Into<Header>,
     Rpc: RpcConvert<Primitives = N::Primitives, Error = EthApiError>,
 {
     async fn get_proof_bundle(
@@ -144,15 +206,52 @@ where
         let proof_root = proof_root_from_account_proof(&proof, block_hash)?;
         let chain_id = provider.chain_spec().chain_id();
 
+        // Depth against the current tip. HyperCore commits EVM block hashes in `evm_db.block_hashes`
+        // for a 256-block window, so this bounds whether `block_hash` is still provably committed.
+        let best_block_number = provider.best_block_number().map_err(|err| {
+            internal_rpc_err(format!("Failed to resolve best block number: {err}"))
+        })?;
+        let core_commitment_depth = best_block_number.saturating_sub(block_number);
+
+        // Canonical header for the pinned block. We RLP-encode the inner `Header` (the `HlHeader`
+        // extras are excluded from the block hash), so `keccak256(rlp) == block_hash`, and surface
+        // the committed sub-roots. `None` if the header is not loadable (e.g. a pending block).
+        let header = match provider
+            .header(&block_hash)
+            .map_err(|err| internal_rpc_err(format!("Failed to load header: {err}")))?
+        {
+            Some(provider_header) => {
+                let eth_header: Header = provider_header.into();
+                let rlp = Bytes::from(alloy_rlp::encode(&eth_header));
+                debug_assert_eq!(
+                    keccak256(rlp.as_ref()),
+                    block_hash,
+                    "canonical header RLP must hash to the pinned block hash"
+                );
+                Some(HlProofBundleHeader {
+                    rlp,
+                    state_root: eth_header.state_root,
+                    transactions_root: eth_header.transactions_root,
+                    receipts_root: eth_header.receipts_root,
+                })
+            }
+            None => None,
+        };
+
         Ok(HlProofBundleResponse {
             version: PROOF_BUNDLE_VERSION,
             chain_id,
             block: HlProofBundleBlock { hash: block_hash, number: block_number },
+            header,
             provenance: HlProofBundleProvenance {
                 proof_root,
                 root_type: SYNTHETIC_ROOT_TYPE,
                 generator: crate::version::rpc_generator(),
                 proof_format: PROOF_FORMAT,
+                anchor_type: AnchorType::SingleNode,
+                core_commitment_depth,
+                evm_state_commitment: None,
+                concise_lt_hashes: None,
             },
             account_proof: proof,
         })
@@ -162,7 +261,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Bytes, U256, address, b256};
+    use crate::HlHeader;
+    use crate::node::primitives::header::HlHeaderExtras;
+    use alloy_primitives::{Bytes, Sealable, U256, address, b256};
     use reth_node_core::version::version_metadata;
     use serde_json::Value;
 
@@ -185,6 +286,16 @@ mod tests {
                     ),
                     number: 7,
                 },
+                header: Some(HlProofBundleHeader {
+                    rlp: Bytes::from_static(&[0xc0]),
+                    state_root: B256::ZERO,
+                    transactions_root: b256!(
+                        "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                    ),
+                    receipts_root: b256!(
+                        "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    ),
+                }),
                 provenance: HlProofBundleProvenance {
                     proof_root: b256!(
                         "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -192,6 +303,10 @@ mod tests {
                     root_type: SYNTHETIC_ROOT_TYPE,
                     generator: crate::version::rpc_generator(),
                     proof_format: PROOF_FORMAT,
+                    anchor_type: AnchorType::SingleNode,
+                    core_commitment_depth: 5,
+                    evm_state_commitment: None,
+                    concise_lt_hashes: None,
                 },
                 account_proof: EIP1186AccountProofResponse {
                     address: address!("0x0000000000000000000000000000000000000011"),
@@ -297,9 +412,59 @@ mod tests {
         assert_eq!(result["provenance"]["rootType"], SYNTHETIC_ROOT_TYPE);
         assert_eq!(result["provenance"]["proofFormat"], PROOF_FORMAT);
         assert_eq!(result["provenance"]["generator"], expected_generator);
+        assert_eq!(result["provenance"]["anchorType"], "single_node");
+        assert_eq!(result["provenance"]["coreCommitmentDepth"], "0x5");
+        // Absent (skip_serializing_if) until the Tier A2 hl-node reader populates them.
+        assert!(result["provenance"]["evmStateCommitment"].is_null());
+        assert!(result["provenance"]["conciseLtHashes"].is_null());
+        assert_eq!(result["header"]["rlp"], "0xc0");
+        assert_eq!(
+            result["header"]["stateRoot"],
+            "0x0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(
+            result["header"]["transactionsRoot"],
+            "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        );
+        assert_eq!(
+            result["header"]["receiptsRoot"],
+            "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
         assert_eq!(result["accountProof"]["address"], "0x0000000000000000000000000000000000000011");
         assert_eq!(result["accountProof"]["balance"], "0x2a");
         assert_eq!(result["accountProof"]["nonce"], "0x3");
         assert_eq!(result["accountProof"]["accountProof"][0], "0x010203");
+    }
+
+    #[test]
+    fn canonical_header_rlp_hashes_to_block_hash() {
+        // The block hash is keccak(rlp(inner Header)); the HlHeader.extras are excluded. So the
+        // bundle's `header.rlp` must encode the inner header (matching block.hash), not the
+        // wrapper. This is the exact invariant get_proof_bundle relies on.
+        let inner = Header { number: 100, gas_limit: 30_000_000, ..Default::default() };
+        let hl = HlHeader {
+            inner,
+            extras: HlHeaderExtras {
+                logs_bloom_with_system_txs: Default::default(),
+                system_tx_count: 3,
+            },
+        };
+
+        let block_hash = Sealable::hash_slow(&hl);
+
+        let eth_header: Header = hl.clone().into();
+        let canonical_rlp = alloy_rlp::encode(&eth_header);
+        assert_eq!(keccak256(&canonical_rlp), block_hash, "inner-header RLP must match block hash");
+
+        // Encoding the HlHeader wrapper (which appends extras) must NOT match the block hash.
+        let wrapper_rlp = alloy_rlp::encode(&hl);
+        assert_ne!(keccak256(&wrapper_rlp), block_hash, "wrapper RLP must not match block hash");
+    }
+
+    #[test]
+    fn anchor_type_serializes_snake_case() {
+        assert_eq!(serde_json::to_value(AnchorType::SingleNode).unwrap(), "single_node");
+        assert_eq!(serde_json::to_value(AnchorType::AttestorQuorum).unwrap(), "attestor_quorum");
+        assert_eq!(serde_json::to_value(AnchorType::ConsensusQuorum).unwrap(), "consensus_quorum");
     }
 }
