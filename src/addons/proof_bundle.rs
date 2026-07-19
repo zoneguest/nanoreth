@@ -138,6 +138,12 @@ pub struct HlProofBundleResponse {
     /// `alloy_trie::proof::verify_proof(header.receiptsRoot, key, Some(value), proof)`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receipt_proof: Option<HlInclusionProof>,
+    /// (Tier A2) HyperCore consensus anchor — present only when the co-located hl-node core-state
+    /// source can supply the quorum-signed app hash for this block; when present it drives
+    /// `provenance.anchorType` to `consensus_quorum`. `None` today (reader not yet wired), so
+    /// `anchorType` stays `single_node`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub core_anchor: Option<HlCoreAnchor>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -175,6 +181,60 @@ pub enum AnchorType {
     AttestorQuorum,
     /// Backed by the hl-node quorum-signed app hash for this block.
     ConsensusQuorum,
+}
+
+impl AnchorType {
+    /// Compute the per-response trust discriminant from the anchoring data actually present.
+    ///
+    /// A present [`HlCoreAnchor`] carries the hl-node quorum-signed app hash, so it resolves to
+    /// [`AnchorType::ConsensusQuorum`]; its absence (unfinalized/beyond-retention block, or no
+    /// co-located core-state source) resolves to [`AnchorType::SingleNode`]. Never hardcoded.
+    fn from_core_anchor(anchor: Option<&HlCoreAnchor>) -> Self {
+        match anchor {
+            Some(_) => Self::ConsensusQuorum,
+            None => Self::SingleNode,
+        }
+    }
+}
+
+/// (Tier A2) HyperCore consensus anchor for this EVM block, sourced from the co-located hl-node.
+///
+/// Populated by a future core-state reader (hl-node persists this via periodic ABCI checkpoints —
+/// `abci_checkpoint.rs`/`visor_abci_state.rs` — including an `lt_hashes.json` for the LtHash state).
+/// When present, the account/tx/receipt proofs in this bundle are backed by the HyperCore validator
+/// quorum, not just the serving node. Verifying consumers check the ed25519 `quorumSignatures`
+/// (≥ threshold stake) over `coreAppHash`, and that this EVM block's hash is in `blockHashWindow`
+/// (which HyperCore commits within a 256-block window) at `blockHashIndex`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HlCoreAnchor {
+    /// The quorum-signed HyperCore app hash for the round that committed this EVM block.
+    pub core_app_hash: B256,
+    /// HyperCore height whose app hash committed this EVM block.
+    #[serde(with = "alloy_serde::quantity")]
+    pub core_height: u64,
+    /// The committed EVM block-hash window (≤256), for proving `H_evm ∈ evm_db.block_hashes`.
+    pub block_hash_window: Vec<B256>,
+    /// Index of this block's hash within `blockHashWindow`.
+    #[serde(with = "alloy_serde::quantity")]
+    pub block_hash_index: u64,
+    /// Commitment to the ed25519 validator set that produced `quorumSignatures`.
+    pub validator_set_hash: B256,
+    /// ed25519 quorum signatures over `coreAppHash` (not aggregatable — one per validator).
+    pub quorum_signatures: Vec<HlQuorumSig>,
+    /// Aggregate stake behind the quorum, in basis points.
+    #[serde(with = "alloy_serde::quantity")]
+    pub quorum_stake_bps: u64,
+}
+
+/// A single validator's ed25519 signature over the core app hash.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HlQuorumSig {
+    #[serde(with = "alloy_serde::quantity")]
+    pub validator_index: u64,
+    /// 64-byte ed25519 signature.
+    pub signature: Bytes,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -370,6 +430,12 @@ where
             None => (None, None),
         };
 
+        // (Tier A2) HyperCore consensus anchor. `None` until the co-located hl-node core-state
+        // reader is wired (hl-node persists this via periodic ABCI checkpoints / lt_hashes.json;
+        // see proof-bundle-enrichment.md §5/§12). Its presence is what makes `anchorType`
+        // resolve to `consensus_quorum`.
+        let core_anchor: Option<HlCoreAnchor> = None;
+
         Ok(HlProofBundleResponse {
             version: PROOF_BUNDLE_VERSION,
             chain_id,
@@ -381,7 +447,7 @@ where
                 generator: crate::version::rpc_generator(),
                 proof_format: PROOF_FORMAT,
                 storage_root,
-                anchor_type: AnchorType::SingleNode,
+                anchor_type: AnchorType::from_core_anchor(core_anchor.as_ref()),
                 core_commitment_depth,
                 evm_state_commitment: None,
                 concise_lt_hashes: None,
@@ -389,6 +455,7 @@ where
             account_proof: proof,
             tx_proof,
             receipt_proof,
+            core_anchor,
         })
     }
 }
@@ -478,6 +545,7 @@ mod tests {
                     value: Bytes::from_static(&[0xcc, 0xdd]),
                     proof: vec![Bytes::from_static(&[0xd0])],
                 }),
+                core_anchor: None,
             })
         }
     }
@@ -607,6 +675,8 @@ mod tests {
         assert_eq!(result["receiptProof"]["index"], "0x1");
         assert_eq!(result["receiptProof"]["value"], "0xccdd");
         assert_eq!(result["receiptProof"]["proof"][0], "0xd0");
+        // A2: no core anchor yet -> absent, and anchorType stays single_node.
+        assert!(result["coreAnchor"].is_null());
     }
 
     #[test]
@@ -680,5 +750,53 @@ mod tests {
         assert_eq!(serde_json::to_value(AnchorType::SingleNode).unwrap(), "single_node");
         assert_eq!(serde_json::to_value(AnchorType::AttestorQuorum).unwrap(), "attestor_quorum");
         assert_eq!(serde_json::to_value(AnchorType::ConsensusQuorum).unwrap(), "consensus_quorum");
+    }
+
+    fn sample_core_anchor() -> HlCoreAnchor {
+        HlCoreAnchor {
+            core_app_hash: b256!(
+                "0x1111111111111111111111111111111111111111111111111111111111111111"
+            ),
+            core_height: 42,
+            block_hash_window: vec![b256!(
+                "0x2222222222222222222222222222222222222222222222222222222222222222"
+            )],
+            block_hash_index: 0,
+            validator_set_hash: b256!(
+                "0x3333333333333333333333333333333333333333333333333333333333333333"
+            ),
+            quorum_signatures: vec![HlQuorumSig {
+                validator_index: 7,
+                signature: Bytes::from_static(&[0xab, 0xcd]),
+            }],
+            quorum_stake_bps: 6700,
+        }
+    }
+
+    #[test]
+    fn anchor_type_computed_from_core_anchor() {
+        // A2: SingleNode when absent, ConsensusQuorum when a core anchor is present (never hardcoded).
+        assert_eq!(AnchorType::from_core_anchor(None), AnchorType::SingleNode);
+        let anchor = sample_core_anchor();
+        assert_eq!(AnchorType::from_core_anchor(Some(&anchor)), AnchorType::ConsensusQuorum);
+    }
+
+    #[test]
+    fn core_anchor_serializes_camel_case() {
+        let v = serde_json::to_value(sample_core_anchor()).unwrap();
+        assert_eq!(
+            v["coreAppHash"],
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
+        );
+        assert_eq!(v["coreHeight"], "0x2a");
+        assert_eq!(v["blockHashIndex"], "0x0");
+        assert_eq!(v["quorumStakeBps"], "0x1a2c"); // 6700
+        assert_eq!(
+            v["validatorSetHash"],
+            "0x3333333333333333333333333333333333333333333333333333333333333333"
+        );
+        assert_eq!(v["quorumSignatures"][0]["validatorIndex"], "0x7");
+        assert_eq!(v["quorumSignatures"][0]["signature"], "0xabcd");
+        assert!(v["blockHashWindow"].is_array());
     }
 }
