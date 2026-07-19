@@ -38,6 +38,16 @@ fn proof_root_from_account_proof(
     Ok(keccak256(first_node))
 }
 
+/// The storage-trie root the returned `storageProof` entries verify against, or `None` when no
+/// storage keys were requested (an empty `storageProof`).
+///
+/// This is the account's `storageHash`. Unlike `proofRoot` — a synthetic, unauthenticated
+/// account-trie root — the storage root is authenticated by the account proof against `proofRoot`,
+/// so storage-slot inclusion/exclusion binds transitively to the same anchor.
+fn storage_root_from_proof(proof: &EIP1186AccountProofResponse) -> Option<B256> {
+    (!proof.storage_proof.is_empty()).then_some(proof.storage_hash)
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HlProofBundleResponse {
@@ -103,6 +113,14 @@ pub struct HlProofBundleProvenance {
     pub root_type: &'static str,
     pub generator: &'static str,
     pub proof_format: &'static str,
+    /// Storage-trie root (`account.storageHash`) that the returned `storageProof` entries verify
+    /// against. Present only when storage keys were requested. Authenticated by the account proof
+    /// against `proofRoot` (unlike `proofRoot` itself, which is a synthetic unauthenticated root),
+    /// so it carries the storage-proof root with explicit provenance rather than as a bare hash in
+    /// the EIP-1186 body. `proofFormat` already describes the (EIP-1186) storage-proof encoding, so
+    /// no separate storage-format tag is emitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_root: Option<B256>,
     /// Per-response trust discriminant (see [`AnchorType`]).
     pub anchor_type: AnchorType,
     /// EVM blocks elapsed since `block.number` (`best_block_number - block.number`).
@@ -138,6 +156,11 @@ pub struct HlProofBundleProvenance {
 ///   `block` and `accountProof` are hash-pinned to the same historical state.
 /// - `pending` is passed through to `eth_getProof` unchanged. Its returned block metadata is
 ///   resolved independently and may not describe the exact pending state used for the proof.
+/// - Passing storage `keys` returns EIP-1186 `storageProof` entries (inclusion or exclusion) for a
+///   contract's slots. They verify against `storageRoot` (the account's `storageHash`), which the
+///   account proof in turn authenticates against `proofRoot` — so contract-state proofs share the
+///   account proof's trust anchor. `storageRoot` is surfaced in `provenance` only when keys are
+///   requested.
 /// - Nanoreth does not guarantee trie state for deep-historical blocks, so this endpoint
 ///   shares the `--experimental-eth-get-proof` gate with `eth_getProof`.
 #[rpc(server, namespace = "hl")]
@@ -204,6 +227,7 @@ where
 
         let proof = EthState::get_proof(&self.eth_api, address, keys, Some(proof_block))?.await?;
         let proof_root = proof_root_from_account_proof(&proof, block_hash)?;
+        let storage_root = storage_root_from_proof(&proof);
         let chain_id = provider.chain_spec().chain_id();
 
         // Depth against the current tip. HyperCore commits EVM block hashes in `evm_db.block_hashes`
@@ -248,6 +272,7 @@ where
                 root_type: SYNTHETIC_ROOT_TYPE,
                 generator: crate::version::rpc_generator(),
                 proof_format: PROOF_FORMAT,
+                storage_root,
                 anchor_type: AnchorType::SingleNode,
                 core_commitment_depth,
                 evm_state_commitment: None,
@@ -264,6 +289,7 @@ mod tests {
     use crate::HlHeader;
     use crate::node::primitives::header::HlHeaderExtras;
     use alloy_primitives::{Bytes, Sealable, U256, address, b256};
+    use alloy_rpc_types_eth::EIP1186StorageProof;
     use reth_node_core::version::version_metadata;
     use serde_json::Value;
 
@@ -303,6 +329,10 @@ mod tests {
                     root_type: SYNTHETIC_ROOT_TYPE,
                     generator: crate::version::rpc_generator(),
                     proof_format: PROOF_FORMAT,
+                    // Matches `storage_hash` below; present because a storage key was requested.
+                    storage_root: Some(b256!(
+                        "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                    )),
                     anchor_type: AnchorType::SingleNode,
                     core_commitment_depth: 5,
                     evm_state_commitment: None,
@@ -319,7 +349,11 @@ mod tests {
                         "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
                     ),
                     account_proof: vec![Bytes::from_static(&[0x01, 0x02, 0x03])],
-                    storage_proof: vec![],
+                    storage_proof: vec![EIP1186StorageProof {
+                        value: U256::from(0x7b),
+                        proof: vec![Bytes::from_static(&[0x11, 0x22])],
+                        ..Default::default()
+                    }],
                 },
             })
         }
@@ -434,6 +468,54 @@ mod tests {
         assert_eq!(result["accountProof"]["balance"], "0x2a");
         assert_eq!(result["accountProof"]["nonce"], "0x3");
         assert_eq!(result["accountProof"]["accountProof"][0], "0x010203");
+        // B2: storage proof surfaced through the envelope, with its authenticated root.
+        assert_eq!(
+            result["provenance"]["storageRoot"],
+            "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        );
+        assert_eq!(result["accountProof"]["storageProof"][0]["value"], "0x7b");
+        assert_eq!(result["accountProof"]["storageProof"][0]["proof"][0], "0x1122");
+    }
+
+    #[test]
+    fn storage_root_present_when_storage_proof_returned() {
+        let proof = EIP1186AccountProofResponse {
+            address: address!("0x0000000000000000000000000000000000000011"),
+            balance: U256::ZERO,
+            code_hash: B256::ZERO,
+            nonce: 0,
+            storage_hash: b256!(
+                "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            ),
+            account_proof: vec![Bytes::from_static(&[0x01])],
+            storage_proof: vec![EIP1186StorageProof {
+                value: U256::from(1),
+                proof: vec![Bytes::from_static(&[0x02])],
+                ..Default::default()
+            }],
+        };
+
+        assert_eq!(
+            storage_root_from_proof(&proof),
+            Some(b256!("0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"))
+        );
+    }
+
+    #[test]
+    fn storage_root_absent_when_no_storage_keys() {
+        let proof = EIP1186AccountProofResponse {
+            address: address!("0x0000000000000000000000000000000000000011"),
+            balance: U256::ZERO,
+            code_hash: B256::ZERO,
+            nonce: 0,
+            storage_hash: b256!(
+                "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            ),
+            account_proof: vec![Bytes::from_static(&[0x01])],
+            storage_proof: vec![],
+        };
+
+        assert_eq!(storage_root_from_proof(&proof), None);
     }
 
     #[test]
