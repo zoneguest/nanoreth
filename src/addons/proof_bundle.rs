@@ -1,6 +1,7 @@
 use crate::HlBlock;
 use crate::addons::inclusion_proof::{HlInclusionProof, ordered_trie_inclusion_proof};
 use crate::node::rpc::{HlEthApi, HlRpcNodeCore};
+use crate::node::types::{ReadPrecompileCalls, ReadPrecompileResult};
 use alloy_consensus::{Header, TxReceipt, transaction::TxHashRef};
 use alloy_eips::{BlockId, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes, keccak256};
@@ -106,6 +107,35 @@ fn tx_and_receipt_proofs(
     Ok((tx_proof, receipt_proof))
 }
 
+/// Flatten a block's recorded read-precompile calls into a per-read list (B3, unanchored).
+///
+/// These are the HyperCore values (SpotBalance/Position/OraclePx/…) the EVM consumed at this block,
+/// as recorded by this node in `BlockReadPrecompileCalls`. Single-node trust — not a HyperCore
+/// commitment (see proof-bundle-enrichment.md §6.1).
+fn core_reads_from_calls(calls: &ReadPrecompileCalls) -> Vec<HlCoreRead> {
+    calls
+        .0
+        .iter()
+        .flat_map(|(precompile, pairs)| {
+            pairs.iter().map(move |(input, result)| {
+                let (status, value) = match result {
+                    ReadPrecompileResult::Ok { bytes, .. } => ("ok", Some(bytes.clone())),
+                    ReadPrecompileResult::OutOfGas => ("outOfGas", None),
+                    ReadPrecompileResult::Error => ("error", None),
+                    ReadPrecompileResult::UnexpectedError => ("unexpectedError", None),
+                };
+                HlCoreRead {
+                    precompile: *precompile,
+                    input: input.input.clone(),
+                    gas_limit: input.gas_limit,
+                    status,
+                    value,
+                }
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HlProofBundleResponse {
@@ -144,6 +174,12 @@ pub struct HlProofBundleResponse {
     /// `anchorType` stays `single_node`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub core_anchor: Option<HlCoreAnchor>,
+    /// (B3, unanchored) HyperCore read-precompile values the EVM consumed at this block, as recorded
+    /// by this node (`BlockReadPrecompileCalls`). Present only when requested via the `coreReads`
+    /// param. **Single-node trust** — `anchorType` stays `single_node`; this is NOT a HyperCore
+    /// commitment, only a corroboration source alongside `txProof`/`receiptProof` (see §6.1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub core_state_reads: Option<Vec<HlCoreRead>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -237,6 +273,26 @@ pub struct HlQuorumSig {
     pub signature: Bytes,
 }
 
+/// (B3, unanchored) One HyperCore read-precompile call the EVM made during a block, as recorded by
+/// this node — a **single-node** attestation, not a HyperCore-committed proof (see §6.1 of the
+/// design doc). Its value is corroboration: a read a contract consumed is reflected in the block's
+/// canonical `receiptsRoot`, so it can be cross-checked against a `txProof`/`receiptProof`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HlCoreRead {
+    /// Read-precompile address — identifies the read kind (e.g. `0x…0800` = Position).
+    pub precompile: Address,
+    /// The precompile call input (the query bytes).
+    pub input: Bytes,
+    #[serde(with = "alloy_serde::quantity")]
+    pub gas_limit: u64,
+    /// Result status: `ok` | `outOfGas` | `error` | `unexpectedError`.
+    pub status: &'static str,
+    /// Raw HyperCore value bytes returned; present only when `status == "ok"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<Bytes>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HlProofBundleProvenance {
@@ -296,6 +352,10 @@ pub struct HlProofBundleProvenance {
 ///   and its receipt against `header.transactionsRoot` / `header.receiptsRoot`. Unlike `proofRoot`,
 ///   those roots are canonical (committed via the block hash into the HyperCore app hash), so the
 ///   proofs are trustless. The `tx` must be a non-system transaction of the resolved block.
+/// - Passing `coreReads = true` adds `coreStateReads`: the HyperCore read-precompile values the EVM
+///   consumed at this block, as recorded by this node. This is **single-node** attested (it does not
+///   change `anchorType`); its value is corroboration — a read a contract used is reflected in the
+///   canonical receipts, so it can be cross-checked against `receiptProof`.
 /// - Nanoreth does not guarantee trie state for deep-historical blocks, so this endpoint
 ///   shares the `--experimental-eth-get-proof` gate with `eth_getProof`.
 #[rpc(server, namespace = "hl")]
@@ -308,6 +368,7 @@ pub trait HlProofBundleApi {
         keys: Vec<JsonStorageKey>,
         block: Option<BlockId>,
         tx: Option<B256>,
+        core_reads: Option<bool>,
     ) -> RpcResult<HlProofBundleResponse>;
 }
 
@@ -340,6 +401,7 @@ where
         keys: Vec<JsonStorageKey>,
         block: Option<BlockId>,
         tx: Option<B256>,
+        core_reads: Option<bool>,
     ) -> RpcResult<HlProofBundleResponse> {
         let requested_block = block.unwrap_or_default();
         trace!(target: "rpc::hl", ?address, ?keys, ?requested_block, "Serving hl_getProofBundle");
@@ -403,23 +465,31 @@ where
             None => None,
         };
 
+        // Load the block once if either tx/receipt proofs or core reads are requested.
+        let full_block = if tx.is_some() || core_reads == Some(true) {
+            Some(
+                provider
+                    .block_by_hash(block_hash)
+                    .map_err(|err| internal_rpc_err(format!("Failed to load block: {err}")))?
+                    .ok_or_else(|| EthApiError::HeaderNotFound(BlockId::Hash(block_hash.into())))?,
+            )
+        } else {
+            None
+        };
+
         // (B1) Optional transaction + receipt inclusion proofs against the canonical
         // `transactionsRoot` / `receiptsRoot`.
-        let (tx_proof, receipt_proof) = match tx {
-            Some(target_hash) => {
+        let (tx_proof, receipt_proof) = match (tx, full_block.as_ref()) {
+            (Some(target_hash), Some(block)) => {
                 let hdr = header.as_ref().ok_or_else(|| {
                     internal_rpc_err("header unavailable for block; cannot build tx/receipt proofs")
                 })?;
-                let full_block = provider
-                    .block_by_hash(block_hash)
-                    .map_err(|err| internal_rpc_err(format!("Failed to load block: {err}")))?
-                    .ok_or_else(|| EthApiError::HeaderNotFound(BlockId::Hash(block_hash.into())))?;
                 let receipts = provider
                     .receipts_by_block(block_hash.into())
                     .map_err(|err| internal_rpc_err(format!("Failed to load receipts: {err}")))?
                     .ok_or_else(|| EthApiError::HeaderNotFound(BlockId::Hash(block_hash.into())))?;
                 let (tx_p, receipt_p) = tx_and_receipt_proofs(
-                    &full_block,
+                    block,
                     &receipts,
                     target_hash,
                     hdr.transactions_root,
@@ -427,8 +497,17 @@ where
                 )?;
                 (Some(tx_p), Some(receipt_p))
             }
-            None => (None, None),
+            _ => (None, None),
         };
+
+        // (B3, unanchored) Optional single-node HyperCore read-precompile snapshot for the block.
+        let core_state_reads = (core_reads == Some(true)).then(|| {
+            full_block
+                .as_ref()
+                .and_then(|b| b.body.read_precompile_calls.as_ref())
+                .map(core_reads_from_calls)
+                .unwrap_or_default()
+        });
 
         // (Tier A2) HyperCore consensus anchor. `None` until the co-located hl-node core-state
         // reader is wired (hl-node persists this via periodic ABCI checkpoints / lt_hashes.json;
@@ -456,6 +535,7 @@ where
             tx_proof,
             receipt_proof,
             core_anchor,
+            core_state_reads,
         })
     }
 }
@@ -480,6 +560,7 @@ mod tests {
             _keys: Vec<JsonStorageKey>,
             _block: Option<BlockId>,
             _tx: Option<B256>,
+            _core_reads: Option<bool>,
         ) -> RpcResult<HlProofBundleResponse> {
             Ok(HlProofBundleResponse {
                 version: PROOF_BUNDLE_VERSION,
@@ -546,6 +627,13 @@ mod tests {
                     proof: vec![Bytes::from_static(&[0xd0])],
                 }),
                 core_anchor: None,
+                core_state_reads: Some(vec![HlCoreRead {
+                    precompile: address!("0x0000000000000000000000000000000000000800"),
+                    input: Bytes::from_static(&[0x01, 0x02]),
+                    gas_limit: 2000,
+                    status: "ok",
+                    value: Some(Bytes::from_static(&[0xbe, 0xef])),
+                }]),
             })
         }
     }
@@ -677,6 +765,40 @@ mod tests {
         assert_eq!(result["receiptProof"]["proof"][0], "0xd0");
         // A2: no core anchor yet -> absent, and anchorType stays single_node.
         assert!(result["coreAnchor"].is_null());
+        // B3 (unanchored): core-state reads surfaced when requested.
+        assert_eq!(
+            result["coreStateReads"][0]["precompile"],
+            "0x0000000000000000000000000000000000000800"
+        );
+        assert_eq!(result["coreStateReads"][0]["input"], "0x0102");
+        assert_eq!(result["coreStateReads"][0]["gasLimit"], "0x7d0"); // 2000
+        assert_eq!(result["coreStateReads"][0]["status"], "ok");
+        assert_eq!(result["coreStateReads"][0]["value"], "0xbeef");
+    }
+
+    #[test]
+    fn core_reads_from_calls_flattens_and_maps_status() {
+        use crate::node::types::ReadPrecompileInput;
+        let calls = ReadPrecompileCalls(vec![(
+            address!("0x0000000000000000000000000000000000000800"),
+            vec![
+                (
+                    ReadPrecompileInput { input: Bytes::from_static(&[0xaa]), gas_limit: 5 },
+                    ReadPrecompileResult::Ok { gas_used: 3, bytes: Bytes::from_static(&[0x11, 0x22]) },
+                ),
+                (
+                    ReadPrecompileInput { input: Bytes::from_static(&[0xbb]), gas_limit: 5 },
+                    ReadPrecompileResult::OutOfGas,
+                ),
+            ],
+        )]);
+        let reads = core_reads_from_calls(&calls);
+        assert_eq!(reads.len(), 2);
+        assert_eq!(reads[0].precompile, address!("0x0000000000000000000000000000000000000800"));
+        assert_eq!(reads[0].status, "ok");
+        assert_eq!(reads[0].value.as_ref().unwrap().as_ref(), &[0x11, 0x22]);
+        assert_eq!(reads[1].status, "outOfGas");
+        assert!(reads[1].value.is_none());
     }
 
     #[test]
